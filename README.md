@@ -8,6 +8,7 @@ Markets do not move only on charts—they move on headlines, policy shocks, and 
 
 ## What this repo contains today
 
+At this point repo contaion simple scripts for buy/sell/hold signals, but in the future we plant to add real time Trading bot integration for high speed event based traiding. 
 Single entry point: `standalone_stock_analyzer.py` — Yahoo Finance data, technical indicators (RSI, MACD, moving averages, Bollinger Bands), optional **Gemini** news sentiment, and BUY/SELL/HOLD-style signals. Use it as the baseline stack while we add richer event feeds (RSS, social APIs, economic calendars, etc.).
 
 ## Setup
