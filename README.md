@@ -1,4 +1,4 @@
-﻿# Stock analyzer
+﻿# Event-based stock prediction bot
 
 Single entry point: `standalone_stock_analyzer.py` — technical indicators (RSI, MACD, moving averages, Bollinger Bands), optional AI news sentiment via Google Gemini, and BUY/SELL/HOLD-style signals using Yahoo Finance data.
 
