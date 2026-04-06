@@ -4,7 +4,7 @@ The goal of this project is to predict and automate stock trades by monitoring t
 
 Markets do not move only on charts—they move on headlines, policy shocks, and high-impact posts that land in real time. This bot is built to treat those moments as first-class inputs alongside technicals.
 
-![Intraday move in major U.S. indices around tariff-related headlines (Yahoo Finance illustration).](./docs/market-event-chart.png)
+<img src="./docs/market-event-chart.png" alt="Intraday move in major U.S. indices around tariff-related headlines (Yahoo Finance illustration)." width="500">
 
 ## What this repo contains today
 
