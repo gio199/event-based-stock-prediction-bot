@@ -3,5 +3,23 @@
 venv/
 __pycache__/
 *.py[cod]
-*.json
 .Python
+.pytest_cache/
+
+# Was covered by the old blanket *.json rule
+.claude/settings.local.json
+
+# Runtime state: settings, dedup rings, the pending analysis queue, and the
+# X session cookie (password-equivalent - see login_x_bot.py).
+data/
+
+# Legacy locations, kept ignored so an older checkout that still has these in
+# the repo root doesn't commit them before app_util.data_path() migrates them.
+web_settings.json
+event_settings.json
+event_seen.json
+event_pending.json
+x_session_state.json
+
+# CSV exports from the CLI's "export results" prompt
+stock_analysis_*.csv

@@ -16,18 +16,12 @@ Features:
 - Combined technical + sentiment signals
 """
 
-import os
+import json
+import logging
 import sys
 import warnings
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -45,139 +39,145 @@ except ImportError as e:
     print(f"\nMissing: {e.name}")
     sys.exit(1)
 
+# Imported after the check above so a missing `requests` still produces the
+# friendly message rather than a traceback out of app_util.
+from app_util import (  # noqa: E402
+    configure_logging,
+    gemini_post,
+    gemini_response_text,
+    get_gemini_api_key,
+    json_safe,
+    load_env_once,
+)
+
+load_env_once()
+
+# Library code logs; only main() below prints, since that is the CLI's own
+# presentation layer. Analysis runs on background threads under the web app,
+# where interleaved bare print() output is unreadable and untimestamped.
+logger = logging.getLogger(__name__)
+
+
+def _unavailable_sentiment(summary: str) -> Dict:
+    """The single shape every failed/absent-sentiment path returns.
+
+    `has_news` False is the important part: it is what keeps _generate_signal
+    from scoring a failure as a real reading, and what makes the web UI render
+    "no news" instead of a confident-looking neutral 0/100. Every early return
+    below goes through here so a new failure path cannot forget it again.
+    """
+    return {
+        'sentiment_score': 0,
+        'confidence': 0,
+        'summary': summary,
+        'market_sentiment': 'neutral',
+        'has_news': False,
+        'articles_count': 0,
+    }
+
 
 class GeminiAIClient:
     """Simple Gemini AI client for sentiment analysis"""
-    
-    def __init__(self):
-        self.api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-        self.base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        self.headers = {
-            'Content-Type': 'application/json',
-            'X-goog-api-key': self.api_key
-        }
-    
+
+    MODEL = "gemini-flash-latest"
+
+    @property
+    def api_key(self) -> str:
+        """Read live rather than captured in __init__, so a client constructed
+        before .env was loaded still picks the key up."""
+        return get_gemini_api_key()
+
     def analyze_sentiment(self, news_text: str, symbol: str) -> Dict:
-        """Analyze sentiment of news articles using Gemini AI"""
+        """Analyze sentiment of news articles using Gemini AI.
+
+        Never raises. Every non-success path returns _unavailable_sentiment(),
+        so callers can trust that a dict with has_news=True came from a real
+        response.
+        """
         if not self.api_key:
-            return {
-                'sentiment_score': 0,
-                'confidence': 0,
-                'summary': 'Set GEMINI_API_KEY for AI news sentiment (technical signals still work)',
-                'market_sentiment': 'neutral',
-            }
+            return _unavailable_sentiment(
+                'Set GEMINI_API_KEY for AI news sentiment (technical signals still work)'
+            )
 
         prompt = f"""
         Analyze the sentiment of the following news articles for {symbol} stock investment purposes.
-        
+
         News Articles:
         {news_text}
-        
-        Provide:
-        1. A sentiment score from -100 (very negative) to +100 (very positive)
-        2. A confidence level from 0-100
-        3. A brief 2-3 sentence summary of the key sentiment drivers
-        4. Overall market sentiment (bullish/bearish/neutral)
-        
-        Format your response EXACTLY as:
-        SENTIMENT_SCORE: [score]
-        CONFIDENCE: [confidence]
-        MARKET_SENTIMENT: [bullish/bearish/neutral]
-        SUMMARY: [summary]
+
+        Respond with a single JSON object shaped exactly as:
+        {{"sentiment_score": <int -100 (very negative) to 100 (very positive)>,
+          "confidence": <int 0 to 100>,
+          "market_sentiment": <"bullish" | "bearish" | "neutral">,
+          "summary": <2-3 sentence string describing the key sentiment drivers>}}
         """
-        
-        try:
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "maxOutputTokens": 500,
-                    "topP": 0.8,
-                    "topK": 10
-                }
-            }
-            
-            response = requests.post(
-                self.base_url,
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'candidates' in data and len(data['candidates']) > 0:
-                    text = data['candidates'][0]['content']['parts'][0]['text']
-                    return self._parse_sentiment(text)
-            elif response.status_code == 429:
-                # Quota exceeded - need new API key
-                return {
-                    'sentiment_score': 0, 
-                    'confidence': 0, 
-                    'summary': 'API quota exceeded - Get free key at: aistudio.google.com/app/apikey', 
-                    'market_sentiment': 'neutral',
-                    'has_news': False,
-                    'articles_count': 0
-                }
-            
-            # Other errors - use technical analysis only
-            return {
-                'sentiment_score': 0, 
-                'confidence': 0, 
-                'summary': 'AI analysis unavailable', 
-                'market_sentiment': 'neutral',
-                'has_news': False,
-                'articles_count': 0
-            }
-            
-        except Exception as e:
-            # Silently fail and use technical analysis only
-            return {'sentiment_score': 0, 'confidence': 0, 'summary': 'Sentiment analysis unavailable', 'market_sentiment': 'neutral'}
-    
-    def _parse_sentiment(self, response: str) -> Dict:
-        """Parse Gemini AI response"""
-        result = {
-            'sentiment_score': 0,
-            'confidence': 0,
-            'summary': '',
-            'market_sentiment': 'neutral'
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 500,
+                "topP": 0.8,
+                "topK": 10,
+                # Asking for JSON directly replaces a line-prefix text parser
+                # that silently returned all-zeros whenever the model wrapped
+                # its labels in markdown or reworded them. EventGeminiClient
+                # already took this approach; both now match.
+                "responseMimeType": "application/json",
+            },
         }
-        
-        lines = response.split('\n')
-        for line in lines:
-            if 'SENTIMENT_SCORE:' in line:
-                try:
-                    score_text = line.split(':')[1].strip()
-                    # Extract number from text
-                    import re
-                    numbers = re.findall(r'-?\d+', score_text)
-                    if numbers:
-                        result['sentiment_score'] = int(numbers[0])
-                except:
-                    pass
-            elif 'CONFIDENCE:' in line:
-                try:
-                    conf_text = line.split(':')[1].strip()
-                    import re
-                    numbers = re.findall(r'\d+', conf_text)
-                    if numbers:
-                        result['confidence'] = int(numbers[0])
-                except:
-                    pass
-            elif 'MARKET_SENTIMENT:' in line:
-                sentiment = line.split(':')[1].strip().lower()
-                if 'bullish' in sentiment:
-                    result['market_sentiment'] = 'bullish'
-                elif 'bearish' in sentiment:
-                    result['market_sentiment'] = 'bearish'
-                else:
-                    result['market_sentiment'] = 'neutral'
-            elif 'SUMMARY:' in line:
-                result['summary'] = line.split(':', 1)[1].strip()
-        
-        return result
+
+        try:
+            response = gemini_post(self.MODEL, payload, timeout=30)
+
+            if response.status_code == 429:
+                return _unavailable_sentiment(
+                    'API quota exceeded - Get free key at: aistudio.google.com/app/apikey'
+                )
+            if response.status_code != 200:
+                logger.warning("Gemini sentiment call for %s returned HTTP %s", symbol, response.status_code)
+                return _unavailable_sentiment('AI analysis unavailable')
+
+            text = gemini_response_text(response.json())
+            if not text:
+                return _unavailable_sentiment('AI analysis unavailable')
+            return self._parse_sentiment(text)
+
+        except Exception as e:
+            # Network error, malformed JSON, unexpected shape - all degrade to
+            # technical-analysis-only rather than propagating.
+            logger.warning("Gemini sentiment call for %s failed: %s", symbol, e)
+            return _unavailable_sentiment('Sentiment analysis unavailable')
+
+    def _parse_sentiment(self, response: str) -> Dict:
+        """Parse the JSON sentiment object, clamped to its documented ranges."""
+        try:
+            data = json.loads(response)
+        except ValueError:
+            logger.warning("Gemini sentiment response was not valid JSON")
+            return _unavailable_sentiment('AI analysis unavailable')
+
+        if not isinstance(data, dict):
+            return _unavailable_sentiment('AI analysis unavailable')
+
+        market_sentiment = str(data.get('market_sentiment', '')).strip().lower()
+        if market_sentiment not in ('bullish', 'bearish', 'neutral'):
+            market_sentiment = 'neutral'
+
+        return {
+            'sentiment_score': _clamp_int(data.get('sentiment_score'), -100, 100),
+            'confidence': _clamp_int(data.get('confidence'), 0, 100),
+            'summary': str(data.get('summary', '')).strip(),
+            'market_sentiment': market_sentiment,
+        }
+
+
+def _clamp_int(value, low: int, high: int) -> int:
+    """Coerce a model-supplied number into an int within [low, high]; 0 if unusable."""
+    try:
+        return max(low, min(high, int(float(value))))
+    except (TypeError, ValueError):
+        return 0
 
 
 class NewsAnalyzer:
@@ -213,48 +213,41 @@ class NewsAnalyzer:
                 news = ticker.news
                 if news:
                     news_items = news[:3]  # Top 3 most recent news items (saves API quota)
-            except:
+            except Exception:
                 pass
             
+            if not news_items:
+                return _unavailable_sentiment('No recent news available')
+
             # Build news text
-            if news_items:
-                news_text = ""
-                for i, item in enumerate(news_items, 1):
-                    title = item.get('title', '')
-                    summary = item.get('summary', '') or item.get('description', '')
-                    news_text += f"{i}. {title}\n{summary}\n\n"
-                
-                # Limit text length (shorter for faster AI processing)
-                if len(news_text) > 2000:
-                    news_text = news_text[:2000] + "..."
-                
-                # Analyze with AI
-                sentiment = self.gemini.analyze_sentiment(news_text, symbol)
-                sentiment['articles_count'] = len(news_items)
-                sentiment['has_news'] = True
-                
-            else:
-                # No news available
-                sentiment = {
-                    'sentiment_score': 0,
-                    'confidence': 0,
-                    'summary': 'No recent news available',
-                    'market_sentiment': 'neutral',
-                    'articles_count': 0,
-                    'has_news': False
-                }
-            
+            news_text = ""
+            for i, item in enumerate(news_items, 1):
+                # yfinance nests article fields under 'content' in current versions;
+                # fall back to the old flat shape in case an older yfinance is installed.
+                fields = item.get('content', item)
+                title = fields.get('title', '')
+                summary = fields.get('summary', '') or fields.get('description', '')
+                news_text += f"{i}. {title}\n{summary}\n\n"
+
+            # Limit text length (shorter for faster AI processing)
+            if len(news_text) > 2000:
+                news_text = news_text[:2000] + "..."
+
+            sentiment = self.gemini.analyze_sentiment(news_text, symbol)
+            # A failed call already carries has_news=False from
+            # _unavailable_sentiment(); only a real response lacks the key, so
+            # setdefault marks exactly the successful path. This used to be
+            # wrong for the network-exception path, which returned a dict with
+            # no has_news at all - so a timeout was promoted to "real neutral
+            # sentiment", scored as such, and shown in the UI as a genuine
+            # 0/100 reading.
+            sentiment.setdefault('has_news', True)
+            sentiment['articles_count'] = len(news_items) if sentiment['has_news'] else 0
             return sentiment
-            
+
         except Exception as e:
-            return {
-                'sentiment_score': 0,
-                'confidence': 0,
-                'summary': f'Error fetching news',
-                'market_sentiment': 'neutral',
-                'articles_count': 0,
-                'has_news': False
-            }
+            logger.warning("Could not fetch news for %s: %s", symbol, e)
+            return _unavailable_sentiment('Error fetching news')
 
 
 class StandaloneStockAnalyzer:
@@ -280,10 +273,13 @@ class StandaloneStockAnalyzer:
         """Initialize the analyzer"""
         self.results = []
         self.news_analyzer = NewsAnalyzer()
-        print("[*] AI News Analysis: ENABLED (Powered by Gemini AI)")
-        print("[!] Note: If API quota exceeded, get FREE key at: aistudio.google.com/app/apikey")
-        print()
-        
+        if self.news_analyzer.gemini.api_key:
+            logger.info("AI News Analysis: ENABLED (Gemini). If quota is exceeded, "
+                        "get a free key at aistudio.google.com/app/apikey")
+        else:
+            logger.info("AI News Analysis: DISABLED (no GEMINI_API_KEY set - technical signals "
+                        "still work). Get a free key at aistudio.google.com/app/apikey")
+
     def calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
         """Calculate Relative Strength Index"""
         try:
@@ -293,8 +289,9 @@ class StandaloneStockAnalyzer:
             
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
-            return rsi.iloc[-1]
-        except:
+            value = rsi.iloc[-1]
+            return value if pd.notna(value) else 50  # Flat window (0/0) -> neutral
+        except Exception:
             return 50  # Neutral if calculation fails
     
     def calculate_macd(self, prices: pd.Series) -> Tuple[float, float, str]:
@@ -314,7 +311,7 @@ class StandaloneStockAnalyzer:
                 trend = "Bearish"
                 
             return macd_val, signal_val, trend
-        except:
+        except Exception:
             return 0, 0, "Neutral"
     
     def calculate_bollinger_bands(self, prices: pd.Series, period: int = 20) -> Dict:
@@ -332,8 +329,9 @@ class StandaloneStockAnalyzer:
             current_lower = lower_band.iloc[-1]
             
             # Calculate position within bands (0 = lower band, 1 = upper band)
-            bb_position = (current_price - current_lower) / (current_upper - current_lower)
-            
+            band_width = current_upper - current_lower
+            bb_position = (current_price - current_lower) / band_width if band_width > 0 else 0.5
+
             return {
                 'upper': current_upper,
                 'middle': current_sma,
@@ -341,7 +339,7 @@ class StandaloneStockAnalyzer:
                 'position': bb_position,
                 'current': current_price
             }
-        except:
+        except Exception:
             return {'upper': 0, 'middle': 0, 'lower': 0, 'position': 0.5, 'current': 0}
     
     def analyze_stock(self, symbol: str) -> Dict:
@@ -350,27 +348,42 @@ class StandaloneStockAnalyzer:
             # Download stock data (90 days for good technical analysis)
             stock = yf.Ticker(symbol)
             df = stock.history(period='3mo')
-            
+
+            # Drop rows with no close price before measuring length: yfinance
+            # returns NaN rows for halted/illiquid sessions, and a NaN
+            # propagating through the rolling means below reaches the API
+            # response, where Starlette's allow_nan=False turns the whole
+            # endpoint into a 500 - losing every other symbol's results too.
+            if not df.empty:
+                df = df.dropna(subset=['Close'])
+
             if df.empty or len(df) < 20:
                 return {'error': f'Insufficient data for {symbol}'}
-            
+
             # Get current price and basic info
             current_price = df['Close'].iloc[-1]
             prev_close = df['Close'].iloc[-2]
             daily_change = ((current_price - prev_close) / prev_close) * 100
-            
-            # Calculate week and month changes
-            week_ago_price = df['Close'].iloc[-5] if len(df) >= 5 else prev_close
-            month_ago_price = df['Close'].iloc[-20] if len(df) >= 20 else prev_close
-            
+
+            # Calculate week and month changes. iloc[-6] is 5 trading sessions
+            # back, matching the "~5 trading days (1 week)" the glossary
+            # advertises; iloc[-5] was one session short. No length guard is
+            # needed - the len(df) < 20 check above already covers both.
+            week_ago_price = df['Close'].iloc[-6]
+            month_ago_price = df['Close'].iloc[-21] if len(df) >= 21 else df['Close'].iloc[0]
+
             week_change = ((current_price - week_ago_price) / week_ago_price) * 100
             month_change = ((current_price - month_ago_price) / month_ago_price) * 100
-            
-            # Calculate moving averages
+
+            # Calculate moving averages. sma_50 stays None on short history
+            # rather than aliasing sma_20: the strict chain in _generate_signal
+            # (price > sma_10 > sma_20 > sma_50) can never hold when the last
+            # two are the same number, which silently downgraded a genuine
+            # strong uptrend from +30 to +20 with no indication why.
             sma_10 = df['Close'].rolling(window=10).mean().iloc[-1]
             sma_20 = df['Close'].rolling(window=20).mean().iloc[-1]
-            sma_50 = df['Close'].rolling(window=50).mean().iloc[-1] if len(df) >= 50 else sma_20
-            
+            sma_50 = df['Close'].rolling(window=50).mean().iloc[-1] if len(df) >= 50 else None
+
             # Technical indicators
             rsi = self.calculate_rsi(df['Close'])
             macd_val, signal_val, macd_trend = self.calculate_macd(df['Close'])
@@ -381,24 +394,20 @@ class StandaloneStockAnalyzer:
             current_volume = df['Volume'].iloc[-1]
             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
             
-            # Calculate support and resistance (52-week high/low approximation)
-            high_52w = df['High'].max()
-            low_52w = df['Low'].min()
+            # Calculate support and resistance from the 3-month window we fetched
+            # (NOT a true 52-week high/low - we only pull period='3mo' of history)
+            high_3mo = df['High'].max()
+            low_3mo = df['Low'].min()
             
             # Fetch news sentiment (with AI)
-            print(f"  [*] Fetching AI news sentiment...", end=' ')
             news_sentiment = self.news_analyzer.get_news_sentiment(symbol)
-            if news_sentiment.get('has_news') and news_sentiment.get('sentiment_score') != 0:
-                print(f"[OK] Found {news_sentiment.get('articles_count', 0)} articles")
+            if news_sentiment.get('has_news'):
+                logger.info("%s: AI news sentiment from %d article(s)",
+                            symbol, news_sentiment.get('articles_count', 0))
             else:
-                status = news_sentiment.get('summary', 'No news')
-                if 'quota' in status.lower():
-                    print(f"[!] API quota exceeded")
-                elif 'unavailable' in status.lower():
-                    print(f"[!] API unavailable")
-                else:
-                    print(f"[=] No recent news")
-            
+                logger.info("%s: no AI news sentiment (%s)",
+                            symbol, news_sentiment.get('summary', 'no news'))
+
             # Generate trading score and signal (includes sentiment)
             score, signal, reasons = self._generate_signal(
                 current_price, rsi, macd_trend, bb, 
@@ -407,9 +416,12 @@ class StandaloneStockAnalyzer:
             )
             
             # Calculate targets and stop loss
-            targets = self._calculate_targets(current_price, signal, bb, low_52w, high_52w)
+            targets = self._calculate_targets(current_price, signal, bb, low_3mo, high_3mo)
             
-            return {
+            # json_safe() is the last line of defence for C6: anything
+            # non-finite that still slipped through becomes null rather than a
+            # NaN literal that Starlette refuses to serialise.
+            return json_safe({
                 'symbol': symbol,
                 'current_price': round(current_price, 2),
                 'daily_change': round(daily_change, 2),
@@ -424,27 +436,30 @@ class StandaloneStockAnalyzer:
                     'macd_trend': macd_trend,
                     'sma_10': round(sma_10, 2),
                     'sma_20': round(sma_20, 2),
-                    'sma_50': round(sma_50, 2),
+                    'sma_50': round(sma_50, 2) if sma_50 is not None else None,
                     'bb_position': round(bb['position'], 2),
                     'volume_ratio': round(volume_ratio, 2),
-                    '52w_high': round(high_52w, 2),
-                    '52w_low': round(low_52w, 2)
+                    '3mo_high': round(high_3mo, 2),
+                    '3mo_low': round(low_3mo, 2)
                 },
                 'sentiment': news_sentiment,
                 'targets': targets,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            
+            })
+
         except Exception as e:
+            logger.warning("Analysis failed for %s: %s", symbol, e)
             return {'error': f'Failed to analyze {symbol}: {str(e)}'}
     
-    def _generate_signal(self, price, rsi, macd_trend, bb, sma_10, sma_20, sma_50, 
-                        volume_ratio, week_change, month_change, news_sentiment: Dict = None) -> Tuple[int, str, List[str]]:
+    def _generate_signal(self, price, rsi, macd_trend, bb, sma_10, sma_20,
+                        sma_50: Optional[float],
+                        volume_ratio, week_change, month_change,
+                        news_sentiment: Optional[Dict] = None) -> Tuple[int, str, List[str]]:
         """Generate buy/sell/hold signal based on technical analysis + news sentiment"""
         score = 0
         reasons = []
         
-        # RSI Analysis (30 points)
+        # RSI Analysis (25 points)
         if rsi < 30:
             score += 25
             reasons.append(f"[+] RSI oversold ({rsi:.1f}) - Strong buy signal")
@@ -461,21 +476,33 @@ class StandaloneStockAnalyzer:
             reasons.append(f"[=] RSI neutral ({rsi:.1f})")
         
         # MACD Analysis (20 points)
+        # Three-way on purpose. calculate_macd() returns "Neutral" from its
+        # exception handler, and folding that into the bearish `else` meant a
+        # *failed* calculation subtracted 20 points and told the user "MACD
+        # bearish" as fact - enough on its own to push a HOLD to a SELL.
+        # calculate_rsi and calculate_bollinger_bands both degrade to a
+        # genuinely neutral, zero-scoring value; MACD now matches them.
         if macd_trend == "Bullish":
             score += 20
             reasons.append("[+] MACD bullish crossover")
-        else:
+        elif macd_trend == "Bearish":
             score -= 20
             reasons.append("[-] MACD bearish")
-        
+        else:
+            reasons.append("[=] MACD unavailable")
+
         # Moving Average Analysis (30 points)
-        if price > sma_10 > sma_20 > sma_50:
+        # sma_50 is None when there isn't 50 sessions of history; the
+        # long-trend comparisons are skipped rather than compared against a
+        # stand-in value that can never satisfy them.
+        has_sma_50 = sma_50 is not None
+        if has_sma_50 and price > sma_10 > sma_20 > sma_50:
             score += 30
             reasons.append("[+] Strong uptrend - All MAs aligned")
         elif price > sma_10 > sma_20:
             score += 20
             reasons.append("[+] Uptrend - Above short-term MAs")
-        elif price < sma_10 < sma_20 < sma_50:
+        elif has_sma_50 and price < sma_10 < sma_20 < sma_50:
             score -= 30
             reasons.append("[-] Strong downtrend - All MAs aligned")
         elif price < sma_10 < sma_20:
@@ -516,7 +543,7 @@ class StandaloneStockAnalyzer:
             
             # Scale sentiment impact based on confidence
             sentiment_impact = (sentiment_score / 100) * 20 * (sentiment_conf / 100)
-            score += sentiment_impact
+            score += round(sentiment_impact)
             
             if sentiment_score > 50:
                 reasons.append(f"[+] Positive news sentiment ({sentiment_score}/100, {articles} articles)")
@@ -555,20 +582,27 @@ class StandaloneStockAnalyzer:
         
         return min(int(base_confidence), 100)
     
-    def _calculate_targets(self, current_price: float, signal: str, bb: Dict, 
-                          low_52w: float, high_52w: float) -> Dict:
+    def _calculate_targets(self, current_price: float, signal: str, bb: Dict,
+                          low_3mo: float, high_3mo: float) -> Dict:
         """Calculate target prices and stop loss"""
         if 'BUY' in signal:
             stop_loss = max(bb['lower'] * 0.98, current_price * 0.93)
             target_1 = min(bb['upper'] * 0.98, current_price * 1.08)
             target_2 = current_price * 1.15
-            risk_reward = abs(target_1 - current_price) / abs(current_price - stop_loss)
-        else:
+        elif 'SELL' in signal:
             stop_loss = min(bb['upper'] * 1.02, current_price * 1.07)
             target_1 = max(bb['lower'] * 1.02, current_price * 0.92)
             target_2 = current_price * 0.85
-            risk_reward = abs(target_1 - current_price) / abs(stop_loss - current_price)
-        
+        else:
+            # HOLD: neutral trading range, not a directional bet -
+            # don't reuse the SELL-oriented (bearish) target math here.
+            stop_loss = max(bb['lower'], current_price * 0.95)
+            target_1 = min(bb['upper'], current_price * 1.05)
+            target_2 = current_price * 1.08
+
+        price_risk = abs(current_price - stop_loss)
+        risk_reward = abs(target_1 - current_price) / price_risk if price_risk > 0 else 0
+
         return {
             'stop_loss': round(stop_loss, 2),
             'target_1': round(target_1, 2),
@@ -694,9 +728,11 @@ class StandaloneStockAnalyzer:
         print(f"   MACD: {tech['macd_trend']}")
         print(f"   SMA-10: ${tech['sma_10']:.2f}")
         print(f"   SMA-20: ${tech['sma_20']:.2f}")
-        print(f"   SMA-50: ${tech['sma_50']:.2f}")
+        # None when the symbol has under 50 sessions of history
+        sma_50 = tech['sma_50']
+        print(f"   SMA-50: ${sma_50:.2f}" if sma_50 is not None else "   SMA-50: n/a (under 50 sessions)")
         print(f"   Volume: {tech['volume_ratio']:.2f}x average")
-        print(f"   52W Range: ${tech['52w_low']:.2f} - ${tech['52w_high']:.2f}")
+        print(f"   3-Month Range: ${tech['3mo_low']:.2f} - ${tech['3mo_high']:.2f}")
         
         # News Sentiment (if available)
         if 'sentiment' in result and result['sentiment'].get('has_news'):
@@ -767,6 +803,7 @@ class StandaloneStockAnalyzer:
 
 def main():
     """Main function to run the analyzer"""
+    configure_logging()  # surface the library-level logger on the console
     print("\n" + "="*80)
     print("STANDALONE STOCK ANALYZER")
     print("="*80)

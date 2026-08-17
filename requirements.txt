@@ -1,5 +1,12 @@
-requests>=2.31.0
-pandas>=2.0.0
-python-dotenv>=1.0.0
-yfinance>=0.2.0
-numpy>=1.24.0 
+# Upper bounds are deliberate. yfinance in particular reshapes its response
+# payloads between minor releases - the analyzer already carries a shim for one
+# such change (the news 'content' nesting) - so an unbounded `>=` invites a
+# silent breakage on a fresh install months from now.
+requests>=2.31.0,<3.0.0
+pandas>=2.0.0,<4.0.0
+python-dotenv>=1.0.0,<2.0.0
+yfinance>=0.2.0,<2.0.0
+numpy>=1.24.0,<3.0.0
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+playwright>=1.45.0,<2.0.0

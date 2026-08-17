@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stock Analyzer</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="app-header">
+  <div class="app-header-top">
+    <h1>Stock Analyzer</h1>
+    <span id="gemini-badge" class="badge badge-muted">Checking AI status&hellip;</span>
+  </div>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="panel-watchlist" data-tab="watchlist">Watchlist</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-custom" data-tab="custom">Custom Analysis</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-glossary" data-tab="glossary">Glossary</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">Settings</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-events" data-tab="events">Event Feed</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Watchlist tab -->
+  <section id="panel-watchlist" class="tab-panel is-active" role="tabpanel">
+    <div class="panel-toolbar">
+      <div class="panel-meta">
+        <span id="watchlist-updated" class="meta-line">Last updated: &mdash;</span>
+        <span id="watchlist-next" class="meta-line meta-muted">Auto-refresh: off</span>
+      </div>
+      <button id="refresh-btn" class="btn btn-primary">Refresh Now</button>
+    </div>
+    <div id="watchlist-progress" class="progress-line" aria-live="polite" hidden></div>
+    <div id="watchlist-errors" class="error-list" hidden></div>
+    <div id="watchlist-grid" class="stock-grid">
+      <div class="empty-state">No analysis yet &mdash; click Refresh Now to analyze the watchlist.</div>
+    </div>
+  </section>
+
+  <!-- Custom analysis tab -->
+  <section id="panel-custom" class="tab-panel" role="tabpanel" hidden>
+    <div class="panel-toolbar custom-toolbar">
+      <input id="custom-symbols" type="text" placeholder="e.g. AMD, COIN, PLTR" aria-label="Stock symbols, comma-separated">
+      <button id="analyze-btn" class="btn btn-primary">Analyze</button>
+    </div>
+    <p class="hint">Up to <span id="custom-max">25</span> symbols, comma or space separated.</p>
+    <div id="custom-progress" class="progress-line" aria-live="polite" hidden></div>
+    <div id="custom-errors" class="error-list" hidden></div>
+    <div id="custom-grid" class="stock-grid">
+      <div class="empty-state">Enter symbols above and click Analyze.</div>
+    </div>
+  </section>
+
+  <!-- Glossary tab -->
+  <section id="panel-glossary" class="tab-panel" role="tabpanel" hidden>
+    <p class="hint">What every metric on this page means.</p>
+    <table class="glossary-table" id="glossary-table">
+      <thead><tr><th>Metric</th><th>What it means</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- Settings tab -->
+  <section id="panel-settings" class="tab-panel" role="tabpanel" hidden>
+    <div class="settings-card">
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <label for="auto-refresh-toggle" class="settings-label">Auto-refresh watchlist</label>
+          <p class="hint">Off by default. When off, the watchlist only updates when you click <strong>Refresh Now</strong> (or on first click after startup). When on, all 12 stocks re-analyze automatically on the interval below &mdash; this fires a burst of Gemini calls each time, which can trip your API key's free-tier quota.</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="auto-refresh-toggle">
+          <span class="switch-track"></span>
+        </label>
+      </div>
+      <div class="settings-row" id="interval-row">
+        <div class="settings-row-text">
+          <label for="refresh-interval-input" class="settings-label">Refresh interval (minutes)</label>
+          <p class="hint">Minimum <span id="min-interval-minutes">1</span> minute.</p>
+        </div>
+        <input type="number" id="refresh-interval-input" min="1" step="1" class="interval-input">
+      </div>
+      <div id="settings-saved" class="settings-saved" hidden>Saved.</div>
+    </div>
+  </section>
+
+  <!-- Event Feed tab -->
+  <section id="panel-events" class="tab-panel" role="tabpanel" hidden>
+    <p class="hint">AI-detected market-moving news &amp; social posts, matched to a ticker where possible. Informational only &mdash; kept separate from the Watchlist/Custom Analysis signals.</p>
+
+    <div id="events-notice" class="error-list" hidden></div>
+    <div id="gemini-health-banner" class="error-list" hidden></div>
+    <div class="settings-card source-health-panel" id="source-health-panel">
+      <!-- source rows injected by app.js -->
+    </div>
+
+    <div class="section-header">
+      <h2 class="section-heading">Latest Posts</h2>
+      <div class="filter-group" role="group" aria-label="Filter posts by source">
+        <button class="filter-btn is-active" data-post-source="">All</button>
+        <button class="filter-btn" data-post-source="trumpstruth">Truth Social</button>
+        <button class="filter-btn" data-post-source="x_musk">X / @elonmusk</button>
+      </div>
+    </div>
+    <p class="hint">The 5 most recent posts, shown as-is &mdash; including ones the AI found no tradeable company in. Enable or disable each source above.</p>
+    <div id="posts-list" class="post-list">
+      <div class="empty-state">No posts fetched yet.</div>
+    </div>
+
+    <h2 class="section-heading">Recent Events</h2>
+    <p class="hint">Only the posts and headlines above that the AI matched to a publicly-traded company.</p>
+    <div id="events-list" class="event-list">
+      <div class="empty-state">No events detected yet.</div>
+    </div>
+  </section>
+</main>
+
+<footer class="app-footer">
+  <p>For education and information only, not financial advice. Data from Yahoo Finance; sentiment from Gemini AI when configured.</p>
+</footer>
+
+<template id="stock-card-template">
+  <article class="stock-card">
+    <header class="card-header">
+      <div class="card-title">
+        <span class="card-symbol"></span>
+        <span class="card-price"></span>
+      </div>
+      <span class="signal-badge" data-metric="signal"></span>
+    </header>
+
+    <div class="card-scoreline">
+      <span class="score-value" data-metric="score"></span>
+      <span class="confidence-value" data-metric="confidence"></span>
+    </div>
+
+    <div class="change-row">
+      <div class="change-cell"><span class="change-label" data-metric="daily_change">Daily</span><span class="change-value" data-field="daily"></span></div>
+      <div class="change-cell"><span class="change-label" data-metric="daily_change">Weekly</span><span class="change-value" data-field="weekly"></span></div>
+      <div class="change-cell"><span class="change-label" data-metric="daily_change">Monthly</span><span class="change-value" data-field="monthly"></span></div>
+    </div>
+
+    <section class="card-section">
+      <h3>Technicals</h3>
+      <div class="meter-row" data-metric="rsi">
+        <div class="meter-label"><span>RSI</span><span class="meter-value" data-field="rsi-value"></span></div>
+        <div class="meter-track meter-track-zoned">
+          <div class="meter-zone meter-zone-good" style="left:0%;width:30%"></div>
+          <div class="meter-zone meter-zone-critical" style="left:70%;width:30%"></div>
+          <div class="meter-fill" data-field="rsi-fill"></div>
+        </div>
+      </div>
+      <div class="metric-rows">
+        <div class="metric-row" data-metric="macd_trend"><span>MACD</span><span data-field="macd"></span></div>
+        <div class="metric-row" data-metric="sma_10"><span>SMA 10 / 20 / 50</span><span data-field="sma"></span></div>
+        <div class="metric-row" data-metric="volume_ratio"><span>Volume</span><span data-field="volume"></span></div>
+        <div class="metric-row" data-metric="3mo_high"><span>3-Month Range</span><span data-field="range"></span></div>
+      </div>
+      <div class="meter-row" data-metric="bb_position">
+        <div class="meter-label"><span>Bollinger Position</span><span class="meter-value" data-field="bb-value"></span></div>
+        <div class="meter-track meter-track-zoned">
+          <div class="meter-zone meter-zone-good" style="left:0%;width:20%"></div>
+          <div class="meter-zone meter-zone-critical" style="left:80%;width:20%"></div>
+          <div class="meter-fill" data-field="bb-fill"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card-section sentiment-section">
+      <h3>News Sentiment</h3>
+      <div class="sentiment-body"></div>
+    </section>
+
+    <section class="card-section">
+      <h3>Price Targets</h3>
+      <div class="metric-rows">
+        <div class="metric-row" data-metric="stop_loss"><span>Stop Loss</span><span data-field="stop-loss"></span></div>
+        <div class="metric-row" data-metric="target_1"><span>Target 1 / 2</span><span data-field="targets"></span></div>
+        <div class="metric-row" data-metric="risk_reward"><span>Risk / Reward</span><span data-field="risk-reward"></span></div>
+      </div>
+    </section>
+
+    <section class="card-section">
+      <h3>Key Factors</h3>
+      <ul class="reasons-list"></ul>
+    </section>
+
+    <footer class="card-footer">
+      <span class="card-timestamp"></span>
+    </footer>
+  </article>
+</template>
+
+<template id="event-card-template">
+  <article class="event-card">
+    <header class="event-card-header">
+      <span class="badge source-badge"></span>
+      <span class="signal-badge event-signal-badge"></span>
+      <span class="ticker-badge">
+        <span class="event-ticker"></span>
+        <span class="event-company"></span>
+        <span class="badge badge-muted unverified-badge" hidden>unverified</span>
+      </span>
+      <span class="event-confidence"></span>
+    </header>
+    <p class="event-title"></p>
+    <p class="event-snippet"></p>
+    <p class="event-reasoning"></p>
+    <footer class="event-card-footer">
+      <a class="event-link" href="#" target="_blank" rel="noopener noreferrer">Source &rarr;</a>
+      <span class="event-timestamp"></span>
+    </footer>
+  </article>
+</template>
+
+<template id="post-card-template">
+  <article class="post-card">
+    <header class="post-card-header">
+      <span class="badge source-badge"></span>
+      <span class="post-author"></span>
+      <span class="post-published"></span>
+    </header>
+    <p class="post-text"></p>
+    <footer class="post-card-footer">
+      <a class="event-link post-link" href="#" target="_blank" rel="noopener noreferrer">Open original &rarr;</a>
+    </footer>
+  </article>
+</template>
+
+<template id="source-health-row-template">
+  <div class="settings-row source-health-row">
+    <div class="settings-row-text">
+      <div class="source-row-heading">
+        <label class="settings-label source-name-label"></label>
+        <span class="badge source-status-badge"></span>
+      </div>
+      <p class="hint source-meta-line"></p>
+      <p class="hint source-error-line" hidden></p>
+    </div>
+    <div class="source-row-controls">
+      <input type="number" class="interval-input source-interval-input" min="1" step="1">
+      <label class="switch">
+        <input type="checkbox" class="source-enabled-toggle">
+        <span class="switch-track"></span>
+      </label>
+    </div>
+  </div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
